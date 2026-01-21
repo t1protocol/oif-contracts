@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import {
+    ReentrancyGuardUpgradeable
+} from "@openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {IT1XChainReader} from "./IT1XChainReader.sol";
+import {OwnableUpgradeable} from "@openzeppelin-contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {WithdrawTrieVerifier} from "../verifier/WithdrawTrieVerifier.sol";
+
+/**
+ * @title T1XChainReader
+ * @notice Facilitates reading data from contracts on other chains through t1
+ */
+contract T1XChainReader is IT1XChainReader, OwnableUpgradeable, ReentrancyGuardUpgradeable {
+    // ============ Events ============
+
+    /**
+     * @notice Emitted when a cross-chain read request is made
+     * @param requestId Unique identifier for the request
+     * @param destinationDomain Domain ID of the target chain
+     * @param targetContract Address of the contract to read from
+     * @param requester Address who initiated the read request
+     * @param minBlock the minimum block on the target chain that you will accept the read to be executed
+     * @param callData The encoded function call
+     * @param nonce The nonce of the read request
+     */
+    event ReadRequested(
+        bytes32 indexed requestId,
+        uint32 indexed destinationDomain,
+        address indexed targetContract,
+        address requester,
+        uint64 minBlock,
+        bytes callData,
+        uint256 nonce
+    );
+
+    /**
+     * @notice Emitted when a proof of read root is committed
+     * @param batchIndex The batch index of the proof of read root
+     */
+    event ProofOfReadRootCommitted(uint256 batchIndex);
+
+    /**
+     * @notice Emitted when the read fee is updated
+     * @param newFee The new fee amount
+     */
+    event FeeUpdated(uint256 newFee);
+
+    /**
+     * @notice Emitted when the fee recipient is updated
+     * @param newFeeRecipient The new fee recipient address
+     */
+    event FeeRecipientUpdated(address newFeeRecipient);
+
+    /**
+     * @notice Emitted when fees are withdrawn
+     * @param recipient The address that received the fees
+     * @param amount The amount of fees withdrawn
+     */
+    event FeesWithdrawn(address recipient, uint256 amount);
+
+    // ============ State Variables ============
+
+    /// @notice The t1 prover
+    address public immutable prover;
+    /// @notice The next batch index to use by the prover for the proof of read
+    uint256 public nextBatchIndex;
+
+    /// @notice Maps batch indices to their proof of read root
+    mapping(uint256 batchIndex => bytes32 root) public proofOfReadRoots;
+
+    /// @notice Fee required to make a read request (defaults to 0)
+    uint256 public readFee;
+    /// @notice Address that can withdraw collected fees
+    address public feeRecipient;
+
+    // ============ Errors ============
+
+    error OnlyProver();
+    error ZeroAddress();
+    error InvalidBatchIndex();
+    error InvalidProof();
+    error IncorrectFee();
+    error NoFeesToWithdraw();
+    error WithdrawFailed();
+    error UnauthorizedFeeWithdraw();
+
+    // ============ Variables ============
+    uint256 public nonce;
+
+    // ============ Modifiers ============
+
+    modifier onlyProver() {
+        if (msg.sender != address(prover)) revert OnlyProver();
+        _;
+    }
+
+    /**
+     * @notice Sets up the T1XChainReader contract
+     * @param _prover Address of the prover
+     */
+    constructor(address _prover) {
+        if (_prover == address(0)) revert ZeroAddress();
+
+        prover = _prover;
+    }
+
+    /**
+     * @notice Initializes the contract
+     * @param _owner The owner of the contract
+     */
+    function initialize(address _owner) external override initializer {
+        __Ownable_init();
+        __ReentrancyGuard_init();
+        _transferOwnership(_owner);
+    }
+
+    // ============ External Functions ============
+
+    /**
+     * @notice Initiates a cross-chain read request
+     * @param request ReadRequest
+     * @return requestId Unique identifier for tracking this request
+     */
+    function requestRead(ReadRequest calldata request)
+        external
+        payable
+        override
+        nonReentrant
+        returns (bytes32 requestId)
+    {
+        if (msg.value != readFee) revert IncorrectFee();
+
+        return _processReadRequest(
+            request.destinationDomain, request.targetContract, request.minBlock, request.callData, request.requester
+        );
+    }
+
+    function _processReadRequest(
+        uint32 destinationDomain,
+        address targetContract,
+        uint64 minBlock,
+        bytes calldata callData,
+        address requester
+    )
+        internal
+        returns (bytes32 requestId)
+    {
+        requestId = keccak256(
+            abi.encodePacked(
+                block.chainid, destinationDomain, targetContract, callData, block.timestamp, requester, nonce
+            )
+        );
+
+        emit ReadRequested(requestId, destinationDomain, targetContract, requester, minBlock, callData, nonce);
+        nonce++;
+    }
+
+    /**
+     * @notice Commit a new proof of read root
+     * @dev Access limited to the prover
+     * @param batchIndex The batch index of the read request
+     * @param newRoot The root of the proof of read merkle tree
+     */
+    function commitProofOfReadRoot(uint256 batchIndex, bytes32 newRoot) external override onlyProver {
+        if (batchIndex > nextBatchIndex) revert InvalidBatchIndex();
+        proofOfReadRoots[batchIndex] = newRoot;
+        nextBatchIndex++;
+        emit ProofOfReadRootCommitted(batchIndex);
+    }
+
+    /**
+     * @notice Verifies a proof of read and returns the raw function result
+     * @dev The result is ABI-encoded as returned by the target function.
+     *      For functions returning dynamic types, you'll need to decode twice:
+     *      1. abi.decode(result, (bytes)) to get the inner bytes
+     *      2. abi.decode(innerBytes, (your expected type))
+     * @param encodedProofOfRead The encoded proof of read which is formatted as following:
+     * abi.encode(uint256 batchIndex, bytes32 requestId, uint256 position, bytes result, bytes proof)
+     * @return requestId The ID of the read request
+     * @return result The raw ABI-encoded return value from the target function
+     */
+    function verifyProofOfRead(bytes calldata encodedProofOfRead)
+        external
+        view
+        override
+        returns (bytes32, bytes memory)
+    {
+        (uint256 batchIndex, bytes32 requestId, uint256 position, bytes memory result, bytes memory proof) =
+            abi.decode(encodedProofOfRead, (uint256, bytes32, uint256, bytes, bytes));
+
+        _verifyProofOfRead(batchIndex, requestId, position, result, proof);
+
+        return (requestId, result);
+    }
+
+    /**
+     * @notice Verifies a proof of read and returns the raw function result
+     * @param encodedProofOfRead The encoded proof of read which is formatted as following:
+     * abi.encode(uint256 batchIndex, bytes32 requestId, uint256 position, bytes proof)
+     * @param result The raw ABI-encoded return value from the target function
+     * @return requestId The ID of the read request
+     */
+    function verifyProofOfReadWithResult(
+        bytes calldata encodedProofOfRead,
+        bytes calldata result
+    )
+        external
+        view
+        returns (bytes32)
+    {
+        (uint256 batchIndex, bytes32 requestId, uint256 position, bytes memory proof) =
+            abi.decode(encodedProofOfRead, (uint256, bytes32, uint256, bytes));
+        _verifyProofOfRead(batchIndex, requestId, position, result, proof);
+        return requestId;
+    }
+
+    /**
+     * @notice Verifies a batch of many proofs of read and returns the raw function results for all of them
+     * @param encodedProofsOfRead Array of encoded proofs of read
+     * @return requestIds The IDs of all read requests, in the same order
+     * @return results The raw ABI-encoded return values from the target function for all read requests, in the same
+     * order
+     */
+    function verifyProofsOfRead(bytes[] calldata encodedProofsOfRead)
+        external
+        view
+        override
+        returns (bytes32[] memory requestIds, bytes[] memory results)
+    {
+        requestIds = new bytes32[](encodedProofsOfRead.length);
+        results = new bytes[](encodedProofsOfRead.length);
+
+        for (uint256 i = 0; i < encodedProofsOfRead.length; i++) {
+            (uint256 batchIndex, bytes32 requestId, uint256 position, bytes memory result, bytes memory proof) =
+                abi.decode(encodedProofsOfRead[i], (uint256, bytes32, uint256, bytes, bytes));
+
+            _verifyProofOfRead(batchIndex, requestId, position, result, proof);
+
+            requestIds[i] = requestId;
+            results[i] = result;
+        }
+    }
+
+    function _verifyProofOfRead(
+        uint256 batchIndex,
+        bytes32 requestId,
+        uint256 position,
+        bytes memory result,
+        bytes memory proof
+    )
+        internal
+        view
+    {
+        bytes32 root = proofOfReadRoots[batchIndex];
+        bytes32 xChainReadResultHash = keccak256(result);
+        bytes32 leaf = keccak256(abi.encodePacked(xChainReadResultHash, requestId));
+
+        if (!WithdrawTrieVerifier.verifyMerkleProof(root, leaf, position, proof)) revert InvalidProof();
+    }
+
+    /**
+     * @notice Set the fee required for read requests
+     * @dev Only callable by the owner
+     * @param _readFee The new fee amount in wei
+     */
+    function setReadFee(uint256 _readFee) external override onlyOwner {
+        readFee = _readFee;
+        emit FeeUpdated(_readFee);
+    }
+
+    /**
+     * @notice Set the address that can withdraw collected fees
+     * @dev Only callable by the owner
+     * @param _feeRecipient The address that can withdraw fees
+     */
+    function setFeeRecipient(address _feeRecipient) external override onlyOwner {
+        if (_feeRecipient == address(0)) revert ZeroAddress();
+        feeRecipient = _feeRecipient;
+        emit FeeRecipientUpdated(_feeRecipient);
+    }
+
+    /**
+     * @notice Withdraw all collected fees to the fee recipient
+     * @dev Only callable by the fee recipient
+     */
+    function withdrawFees() external override {
+        if (msg.sender != feeRecipient) revert UnauthorizedFeeWithdraw();
+
+        uint256 amount = address(this).balance;
+        (bool success,) = feeRecipient.call{ value: amount }("");
+        if (!success) revert WithdrawFailed();
+
+        emit FeesWithdrawn(feeRecipient, amount);
+    }
+}
