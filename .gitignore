@@ -20,3 +20,6 @@ lcov.info
 
 # Cursor
 .cursorrules
+
+# IntelliJ
+.idea
